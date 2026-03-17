@@ -1,0 +1,173 @@
+name: Sync upstream and build SFTP releases
+
+on:
+  schedule:
+    - cron: "0 6 * * 1"
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+  IMAGE_NAME: freshost/velero
+  SFTP_COMMIT: b1fe737012c158586dc675ab533213fc85c48551
+
+jobs:
+  sync-and-build:
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      packages: write
+    steps:
+      - name: Checkout fork
+        uses: actions/checkout@v4
+        with:
+          ref: freshost
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+
+      - name: Add upstream remote and fetch tags
+        run: |
+          git remote add upstream https://github.com/vmware-tanzu/velero.git
+          git fetch upstream --tags --force
+
+      - name: Find new stable tags in latest 2 minor series
+        id: find-tags
+        run: |
+          ALL_TAGS=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V)
+          LATEST_MINORS=$(echo "$ALL_TAGS" | sed -E 's/\.[0-9]+$//' | sort -V | uniq | tail -2)
+          echo "Tracking minor series:"
+          echo "$LATEST_MINORS"
+          NEW_TAGS=""
+          for MINOR in $LATEST_MINORS; do
+            for TAG in $(echo "$ALL_TAGS" | grep "^${MINOR}\."); do
+              SFTP_TAG="${TAG}-sftp"
+              if ! git tag -l "$SFTP_TAG" | grep -q .; then
+                NEW_TAGS="${NEW_TAGS} ${TAG}"
+              fi
+            done
+          done
+          NEW_TAGS=$(echo "$NEW_TAGS" | xargs)
+          echo "new_tags=${NEW_TAGS}" >> "$GITHUB_OUTPUT"
+          if [ -z "$NEW_TAGS" ]; then
+            echo "No new upstream tags to process."
+          else
+            echo "New tags to process: $NEW_TAGS"
+          fi
+
+      - name: Cherry-pick SFTP commit onto each new tag
+        if: steps.find-tags.outputs.new_tags != ''
+        id: cherry-pick
+        run: |
+          BUILT_TAGS=""
+          FAILED_TAGS=""
+          for TAG in ${{ steps.find-tags.outputs.new_tags }}; do
+            SFTP_TAG="${TAG}-sftp"
+            echo "::group::Processing ${TAG} -> ${SFTP_TAG}"
+            git checkout "${TAG}"
+            if git cherry-pick --no-commit "${{ env.SFTP_COMMIT }}" 2>/dev/null; then
+              git commit -m "Add SFTP as a Kopia repository storage backend
+
+          Cherry-picked from freshost branch for ${TAG}.
+          Original commit: ${{ env.SFTP_COMMIT }}"
+              git tag "${SFTP_TAG}"
+              git push origin "${SFTP_TAG}"
+              BUILT_TAGS="${BUILT_TAGS} ${SFTP_TAG}"
+              echo "Successfully tagged ${SFTP_TAG}"
+            else
+              git cherry-pick --abort 2>/dev/null || true
+              FAILED_TAGS="${FAILED_TAGS} ${TAG}"
+              echo "::warning::Cherry-pick failed for ${TAG}"
+            fi
+            echo "::endgroup::"
+          done
+          echo "built_tags=$(echo ${BUILT_TAGS} | xargs)" >> "$GITHUB_OUTPUT"
+          echo "failed_tags=$(echo ${FAILED_TAGS} | xargs)" >> "$GITHUB_OUTPUT"
+
+      - name: Set up Docker Buildx
+        if: steps.cherry-pick.outputs.built_tags != ''
+        uses: docker/setup-buildx-action@v3
+
+      - name: Login to GHCR
+        if: steps.cherry-pick.outputs.built_tags != ''
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Build and push images
+        if: steps.cherry-pick.outputs.built_tags != ''
+        run: |
+          for SFTP_TAG in ${{ steps.cherry-pick.outputs.built_tags }}; do
+            echo "::group::Building ${SFTP_TAG}"
+            git checkout "${SFTP_TAG}"
+            docker buildx build \
+              --platform linux/amd64 \
+              --push \
+              --tag "${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${SFTP_TAG}" \
+              --build-arg BIN=velero \
+              --build-arg PKG=github.com/vmware-tanzu/velero \
+              --build-arg "VERSION=${SFTP_TAG}" \
+              --build-arg "GIT_SHA=$(git rev-parse HEAD)" \
+              --build-arg GIT_TREE_STATE=clean \
+              --build-arg "REGISTRY=${{ env.REGISTRY }}/freshost" \
+              --build-arg RESTIC_VERSION=0.15.0 \
+              --cache-from type=gha \
+              --cache-to type=gha,mode=max \
+              .
+            echo "Pushed ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${SFTP_TAG}"
+            echo "::endgroup::"
+          done
+
+      - name: Open issue for failed cherry-picks
+        if: steps.cherry-pick.outputs.failed_tags != ''
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const failed = '${{ steps.cherry-pick.outputs.failed_tags }}'.trim();
+            await github.rest.issues.create({
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              title: `SFTP cherry-pick failed for: ${failed}`,
+              body: [
+                'The automated SFTP sync workflow failed to cherry-pick commit',
+                '`${{ env.SFTP_COMMIT }}` onto the following upstream tags:',
+                '',
+                ...failed.split(' ').map(t => `- \\`${t}\\``),
+                '',
+                'This likely means upstream changed files touched by the SFTP patch.',
+                'Manual resolution required:',
+                '```bash',
+                'git fetch upstream --tags',
+                'git checkout <tag>',
+                'git cherry-pick ${{ env.SFTP_COMMIT }}',
+                '# resolve conflicts',
+                'git tag <tag>-sftp',
+                'git push origin <tag>-sftp',
+                '```',
+              ].join('\\n'),
+              labels: ['automation'],
+            });
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "## Sync Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          BUILT="${{ steps.cherry-pick.outputs.built_tags }}"
+          FAILED="${{ steps.cherry-pick.outputs.failed_tags }}"
+          if [ -n "$BUILT" ]; then
+            echo "### Built and pushed:" >> "$GITHUB_STEP_SUMMARY"
+            for t in $BUILT; do echo "- \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${t}\`" >> "$GITHUB_STEP_SUMMARY"; done
+          fi
+          if [ -n "$FAILED" ]; then
+            echo "### Failed (issue opened):" >> "$GITHUB_STEP_SUMMARY"
+            for t in $FAILED; do echo "- \`${t}\`" >> "$GITHUB_STEP_SUMMARY"; done
+          fi
+          if [ -z "$BUILT" ] && [ -z "$FAILED" ]; then
+            echo "No new upstream tags found." >> "$GITHUB_STEP_SUMMARY"
+          fi
