@@ -8,6 +8,9 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: freshost/velero
+  # SHA of the SFTP backend commit on the freshost branch.
+  # The Go source files from this commit are applied to each new tag.
+  # go.mod/go.sum are regenerated via go mod tidy per target version.
   SFTP_COMMIT: b1fe737012c158586dc675ab533213fc85c48551
 
 jobs:
@@ -23,6 +26,12 @@ jobs:
           ref: freshost
           fetch-depth: 0
           token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Set up Go
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: go.mod
+          cache: false
 
       - name: Configure git
         run: |
@@ -58,41 +67,76 @@ jobs:
             echo "New tags to process: $NEW_TAGS"
           fi
 
-      - name: Cherry-pick SFTP commit onto each new tag
+      - name: Apply SFTP patch to each new tag
         if: steps.find-tags.outputs.new_tags != ''
-        id: cherry-pick
+        id: patch
         run: |
           BUILT_TAGS=""
           FAILED_TAGS=""
+
+          # Extract the list of Go source files changed in the SFTP commit
+          # (everything except go.mod and go.sum)
+          SFTP_FILES=$(git diff-tree --no-commit-id --name-only -r "${{ env.SFTP_COMMIT }}" \
+            | grep -v '^go\.\(mod\|sum\)$')
+          echo "SFTP source files to apply:"
+          echo "$SFTP_FILES"
+
           for TAG in ${{ steps.find-tags.outputs.new_tags }}; do
             SFTP_TAG="${TAG}-sftp"
             echo "::group::Processing ${TAG} -> ${SFTP_TAG}"
-            git checkout "${TAG}"
-            if git cherry-pick --no-commit "${{ env.SFTP_COMMIT }}" 2>/dev/null; then
-              git commit -m "Add SFTP as a Kopia repository storage backend
 
-          Cherry-picked from freshost branch for ${TAG}.
-          Original commit: ${{ env.SFTP_COMMIT }}"
-              git tag "${SFTP_TAG}"
-              git push origin "${SFTP_TAG}"
-              BUILT_TAGS="${BUILT_TAGS} ${SFTP_TAG}"
-              echo "Successfully tagged ${SFTP_TAG}"
-            else
-              git cherry-pick --abort 2>/dev/null || true
+            # Always start clean
+            git checkout -f "${TAG}" 2>/dev/null || { echo "::warning::Cannot checkout ${TAG}"; FAILED_TAGS="${FAILED_TAGS} ${TAG}"; echo "::endgroup::"; continue; }
+            git clean -fd
+
+            # Apply only the Go source file changes (skip go.mod/go.sum)
+            APPLY_OK=true
+            for FILE in $SFTP_FILES; do
+              DIR=$(dirname "$FILE")
+              mkdir -p "$DIR"
+              if git show "${{ env.SFTP_COMMIT }}:${FILE}" > "${FILE}" 2>/dev/null; then
+                git add "${FILE}"
+              else
+                echo "::warning::Failed to extract ${FILE} from SFTP commit"
+                APPLY_OK=false
+                break
+              fi
+            done
+
+            if [ "$APPLY_OK" = false ]; then
+              git reset --hard HEAD
               FAILED_TAGS="${FAILED_TAGS} ${TAG}"
-              echo "::warning::Cherry-pick failed for ${TAG}"
+              echo "::endgroup::"
+              continue
             fi
+
+            # Add the new SFTP dependency and tidy
+            go get github.com/pkg/sftp
+            go mod tidy
+            git add go.mod go.sum
+
+            # Commit and tag
+            git commit -m "Add SFTP as a Kopia repository storage backend
+
+Applied from freshost branch for ${TAG}.
+Source commit: ${{ env.SFTP_COMMIT }}"
+
+            git tag "${SFTP_TAG}"
+            git push origin "${SFTP_TAG}"
+            BUILT_TAGS="${BUILT_TAGS} ${SFTP_TAG}"
+            echo "Successfully tagged ${SFTP_TAG}"
             echo "::endgroup::"
           done
+
           echo "built_tags=$(echo ${BUILT_TAGS} | xargs)" >> "$GITHUB_OUTPUT"
           echo "failed_tags=$(echo ${FAILED_TAGS} | xargs)" >> "$GITHUB_OUTPUT"
 
       - name: Set up Docker Buildx
-        if: steps.cherry-pick.outputs.built_tags != ''
+        if: steps.patch.outputs.built_tags != ''
         uses: docker/setup-buildx-action@v3
 
       - name: Login to GHCR
-        if: steps.cherry-pick.outputs.built_tags != ''
+        if: steps.patch.outputs.built_tags != ''
         uses: docker/login-action@v3
         with:
           registry: ${{ env.REGISTRY }}
@@ -100,9 +144,9 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push images
-        if: steps.cherry-pick.outputs.built_tags != ''
+        if: steps.patch.outputs.built_tags != ''
         run: |
-          for SFTP_TAG in ${{ steps.cherry-pick.outputs.built_tags }}; do
+          for SFTP_TAG in ${{ steps.patch.outputs.built_tags }}; do
             echo "::group::Building ${SFTP_TAG}"
             git checkout "${SFTP_TAG}"
             docker buildx build \
@@ -123,33 +167,27 @@ jobs:
             echo "::endgroup::"
           done
 
-      - name: Open issue for failed cherry-picks
-        if: steps.cherry-pick.outputs.failed_tags != ''
+      - name: Open issue for failed patches
+        if: steps.patch.outputs.failed_tags != ''
         uses: actions/github-script@v7
         with:
           script: |
-            const failed = '${{ steps.cherry-pick.outputs.failed_tags }}'.trim();
+            const failed = '${{ steps.patch.outputs.failed_tags }}'.trim();
             await github.rest.issues.create({
               owner: context.repo.owner,
               repo: context.repo.repo,
-              title: `SFTP cherry-pick failed for: ${failed}`,
+              title: `SFTP patch failed for: ${failed}`,
               body: [
-                'The automated SFTP sync workflow failed to cherry-pick commit',
-                '`${{ env.SFTP_COMMIT }}` onto the following upstream tags:',
+                'The automated SFTP sync workflow failed to apply the SFTP patch',
+                'onto the following upstream tags:',
                 '',
-                ...failed.split(' ').map(t => `- \\`${t}\\``),
+                ...failed.split(' ').map(t => `- \`${t}\``),
+                '',
+                'Source commit: `${{ env.SFTP_COMMIT }}`',
                 '',
                 'This likely means upstream changed files touched by the SFTP patch.',
-                'Manual resolution required:',
-                '```bash',
-                'git fetch upstream --tags',
-                'git checkout <tag>',
-                'git cherry-pick ${{ env.SFTP_COMMIT }}',
-                '# resolve conflicts',
-                'git tag <tag>-sftp',
-                'git push origin <tag>-sftp',
-                '```',
-              ].join('\\n'),
+                'Manual resolution required.',
+              ].join('\n'),
               labels: ['automation'],
             });
 
@@ -158,8 +196,8 @@ jobs:
         run: |
           echo "## Sync Results" >> "$GITHUB_STEP_SUMMARY"
           echo "" >> "$GITHUB_STEP_SUMMARY"
-          BUILT="${{ steps.cherry-pick.outputs.built_tags }}"
-          FAILED="${{ steps.cherry-pick.outputs.failed_tags }}"
+          BUILT="${{ steps.patch.outputs.built_tags }}"
+          FAILED="${{ steps.patch.outputs.failed_tags }}"
           if [ -n "$BUILT" ]; then
             echo "### Built and pushed:" >> "$GITHUB_STEP_SUMMARY"
             for t in $BUILT; do echo "- \`${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${t}\`" >> "$GITHUB_STEP_SUMMARY"; done
