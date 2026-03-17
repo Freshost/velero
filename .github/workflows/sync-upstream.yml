@@ -3,7 +3,7 @@ name: Sync upstream and build SFTP releases
 on:
   schedule:
     - cron: '0 6 * * 1'  # Every Monday at 06:00 UTC
-  workflow_dispatch:       # Manual trigger
+  workflow_dispatch:
 
 env:
   REGISTRY: ghcr.io
