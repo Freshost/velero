@@ -3,6 +3,7 @@ name: Build Velero Image
 on:
   push:
     branches: [freshost]
+    tags: ['v*-sftp']
 
 env:
   REGISTRY: ghcr.io
@@ -26,16 +27,25 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
 
+      - name: Determine image tag
+        id: meta
+        run: |
+          if [[ "$GITHUB_REF" == refs/tags/* ]]; then
+            echo "tag=${GITHUB_REF#refs/tags/}" >> "$GITHUB_OUTPUT"
+          else
+            echo "tag=dev" >> "$GITHUB_OUTPUT"
+          fi
+
       - uses: docker/build-push-action@v6
         with:
           context: .
           platforms: linux/amd64
           push: true
-          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:v1.17.1-sftp
+          tags: ${{ env.REGISTRY }}/${{ env.IMAGE_NAME }}:${{ steps.meta.outputs.tag }}
           build-args: |
             BIN=velero
             PKG=github.com/vmware-tanzu/velero
-            VERSION=v1.17.1-sftp
+            VERSION=${{ steps.meta.outputs.tag }}
             GIT_SHA=${{ github.sha }}
             GIT_TREE_STATE=clean
             REGISTRY=${{ env.REGISTRY }}/freshost
