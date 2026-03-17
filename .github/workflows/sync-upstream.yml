@@ -1,6 +1,9 @@
 name: Sync upstream and build SFTP releases
 
 on:
+  push:
+    branches:
+      - never-trigger-on-push
   schedule:
     - cron: "0 6 * * 1"
   workflow_dispatch:
