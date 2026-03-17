@@ -8,6 +8,9 @@ on:
 env:
   REGISTRY: ghcr.io
   IMAGE_NAME: freshost/velero
+  # SHA of the SFTP backend commit on the freshost branch.
+  # The Go source files from this commit are applied to each new tag.
+  # go.mod/go.sum are regenerated via go mod tidy per target version.
   SFTP_COMMIT: b1fe737012c158586dc675ab533213fc85c48551
 
 jobs:
@@ -39,25 +42,23 @@ jobs:
           git remote add upstream https://github.com/vmware-tanzu/velero.git
           git fetch upstream --tags --force
 
-      - name: Find new tags
+      - name: Find new tags in latest minor series
         id: find-tags
         run: |
           ALL_TAGS=$(git tag -l 'v*' | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | sort -V)
-          LATEST_MINORS=$(echo "$ALL_TAGS" | sed -E 's/\.[0-9]+$//' | sort -V | uniq | tail -2)
-          echo "Tracking: $LATEST_MINORS"
+          LATEST_MINOR=$(echo "$ALL_TAGS" | sed -E 's/\.[0-9]+$//' | sort -V | uniq | tail -1)
+          echo "Tracking latest minor series: $LATEST_MINOR"
           NEW_TAGS=""
-          for MINOR in $LATEST_MINORS; do
-            for TAG in $(echo "$ALL_TAGS" | grep "^${MINOR}\."); do
-              if ! git tag -l "${TAG}-sftp" | grep -q .; then
-                NEW_TAGS="${NEW_TAGS} ${TAG}"
-              fi
-            done
+          for TAG in $(echo "$ALL_TAGS" | grep "^${LATEST_MINOR}\."); do
+            if ! git tag -l "${TAG}-sftp" | grep -q .; then
+              NEW_TAGS="${NEW_TAGS} ${TAG}"
+            fi
           done
           NEW_TAGS=$(echo "$NEW_TAGS" | xargs)
           echo "new_tags=${NEW_TAGS}" >> "$GITHUB_OUTPUT"
           echo "Tags to process: ${NEW_TAGS:-none}"
 
-      - name: Apply SFTP patch
+      - name: Apply SFTP patch, build, and tag
         if: steps.find-tags.outputs.new_tags != ''
         id: patch
         run: |
@@ -65,33 +66,61 @@ jobs:
           BUILT_TAGS=""
           FAILED_TAGS=""
           SFTP_FILES=$(git diff-tree --no-commit-id --name-only -r "$SFTP_COMMIT" | grep -v '^go\.\(mod\|sum\)$')
+          echo "SFTP source files: $SFTP_FILES"
+
           for TAG in ${{ steps.find-tags.outputs.new_tags }}; do
             SFTP_TAG="${TAG}-sftp"
             echo "::group::${TAG} -> ${SFTP_TAG}"
+
             git checkout -f "${TAG}"
             git clean -fd
+
+            # Apply Go source files
             OK=true
             for FILE in $SFTP_FILES; do
               mkdir -p "$(dirname "$FILE")"
               git show "${SFTP_COMMIT}:${FILE}" > "${FILE}" 2>/dev/null || { OK=false; break; }
               git add "${FILE}"
             done
-            if [ "$OK" = true ]; then
-              go get github.com/pkg/sftp
-              go mod tidy
-              git add go.mod go.sum
-              git commit -m "Add SFTP backend for ${TAG}"
-              git tag "${SFTP_TAG}"
-              git push origin "${SFTP_TAG}"
-              BUILT_TAGS="${BUILT_TAGS} ${SFTP_TAG}"
-            else
+            if [ "$OK" = false ]; then
+              echo "::warning::Failed to apply source files for ${TAG}"
               git reset --hard HEAD
               FAILED_TAGS="${FAILED_TAGS} ${TAG}"
+              echo "::endgroup::"
+              continue
             fi
+
+            # Update dependencies
+            go get github.com/pkg/sftp
+            go mod tidy
+            git add go.mod go.sum
+
+            # Verify build compiles before tagging
+            echo "Verifying build compiles..."
+            if ! go build ./pkg/repository/...; then
+              echo "::warning::Build failed for ${TAG} -- SFTP code incompatible with this version"
+              git reset --hard HEAD
+              FAILED_TAGS="${FAILED_TAGS} ${TAG}"
+              echo "::endgroup::"
+              continue
+            fi
+
+            git commit -m "Add SFTP backend for ${TAG}"
+            git tag "${SFTP_TAG}"
+            BUILT_TAGS="${BUILT_TAGS} ${SFTP_TAG}"
+            echo "Tagged ${SFTP_TAG}"
             echo "::endgroup::"
           done
+
           echo "built_tags=$(echo $BUILT_TAGS | xargs)" >> "$GITHUB_OUTPUT"
           echo "failed_tags=$(echo $FAILED_TAGS | xargs)" >> "$GITHUB_OUTPUT"
+
+      - name: Push tags
+        if: steps.patch.outputs.built_tags != ''
+        run: |
+          for SFTP_TAG in ${{ steps.patch.outputs.built_tags }}; do
+            git push origin "${SFTP_TAG}"
+          done
 
       - name: Set up Docker Buildx
         if: steps.patch.outputs.built_tags != ''
@@ -136,13 +165,28 @@ jobs:
               owner: context.repo.owner,
               repo: context.repo.repo,
               title: 'SFTP patch failed for: ' + failed,
-              body: 'Failed to apply SFTP patch to: ' + failed,
+              body: 'The SFTP patch could not be applied or compiled for:\n\n' +
+                failed.split(' ').map(t => '- `' + t + '`').join('\n') +
+                '\n\nSource commit: `${{ env.SFTP_COMMIT }}`\n\n' +
+                'This likely means the SFTP code needs to be adapted for this Velero version.',
               labels: ['automation'],
             });
 
       - name: Summary
         if: always()
         run: |
-          echo "## Sync Results" >> "$GITHUB_STEP_SUMMARY"
-          echo "Built: ${{ steps.patch.outputs.built_tags }}" >> "$GITHUB_STEP_SUMMARY"
-          echo "Failed: ${{ steps.patch.outputs.failed_tags }}" >> "$GITHUB_STEP_SUMMARY"
+          echo "## SFTP Sync Results" >> "$GITHUB_STEP_SUMMARY"
+          echo "" >> "$GITHUB_STEP_SUMMARY"
+          BUILT="${{ steps.patch.outputs.built_tags }}"
+          FAILED="${{ steps.patch.outputs.failed_tags }}"
+          if [ -n "$BUILT" ]; then
+            echo "### Built and pushed:" >> "$GITHUB_STEP_SUMMARY"
+            for t in $BUILT; do echo "- \`${REGISTRY}/${IMAGE_NAME}:${t}\`" >> "$GITHUB_STEP_SUMMARY"; done
+          fi
+          if [ -n "$FAILED" ]; then
+            echo "### Failed:" >> "$GITHUB_STEP_SUMMARY"
+            for t in $FAILED; do echo "- \`${t}\`" >> "$GITHUB_STEP_SUMMARY"; done
+          fi
+          if [ -z "$BUILT" ] && [ -z "$FAILED" ]; then
+            echo "No new upstream tags found." >> "$GITHUB_STEP_SUMMARY"
+          fi
